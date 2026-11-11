@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Persist an OpenRGB profile into an ASRock Polychrome USB LED controller.
+
+OpenRGB drives the controller live but never sends its "commit" command, and
+OpenRGB's Direct mode is a host-side stream that the controller cannot store,
+so after power-on the LEDs stay dark (or stale) until OpenRGB starts again.
+
+This tool reads a saved OpenRGB profile, converts the ASRock entry into the
+controller's built-in per-zone effects, writes them and commits them to the
+controller's flash so they show from power-on, before any OS is running.
+
+The protocol is the one used by OpenRGB's
+Controllers/ASRockPolychromeUSBController driver (USB 26ce:01a2).
+"""
+
+import argparse
+import glob
+import json
+import os
+import select
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+HID_ID = "0003:000026CE:000001A2"  # bus:vendor:product as the kernel reports it
+
+CMD_SET_ZONE = 0x10
+CMD_READ_ZONE = 0x11
+CMD_COMMIT = 0x12
+CMD_READ_HEADER = 0x14
+CMD_WRITE_HEADER = 0x15
+
+CFG_AVAILABLE = 0x01  # bitmask: zones present on this board
+CFG_LEDCOUNT = 0x02   # one byte per zone: LED count, 0x1E = zone absent
+CFG_RGSWAP = 0x03     # bitmask: zones whose red/green bytes are swapped
+
+ZONE_ABSENT = 0x1E
+ADDRESSABLE_ZONES = {2, 3, 7}
+
+ZONE_NAMES = [
+    "RGB LED 1 Header",
+    "RGB LED 2 Header",
+    "Addressable Header 1",
+    "Addressable Header 2",
+    "PCH",
+    "IO Cover",
+    "PCB",
+    "Addressable Header 3/Audio",
+]
+
+# OpenRGB mode name -> controller effect id.
+EFFECTS = {
+    "Off": 0x00, "Static": 0x01, "Breathing": 0x02, "Strobe": 0x03,
+    "Spectrum Cycle": 0x04, "Random": 0x05, "Music": 0x06, "Wave": 0x07,
+    "Spring": 0x08, "Stack": 0x09, "Cram": 0x0A, "Scan": 0x0B,
+    "Neon": 0x0C, "Water": 0x0D, "Rainbow": 0x0E,
+}
+COLOURED_EFFECTS = {0x01, 0x02, 0x03}
+EFFECT_NAMES = {v: k for k, v in EFFECTS.items()} | {
+    0x0F: "Direct",
+    0xE2: "Direct (stream)",
+    0xE3: "Direct (stream)",
+}
+
+OPENRGB_DESCRIPTION = "ASRock Polychrome USB Device"
+OPENRGB_DETECTOR = "ASRock Polychrome USB"
+
+
+class DeviceError(Exception):
+    pass
+
+
+def is_controller(node):
+    try:
+        return f"HID_ID={HID_ID}" in Path(node, "device/uevent").read_text()
+    except OSError:
+        return False
+
+
+def find_device(requested=None):
+    if requested:
+        # Never send these reports to some other HID device.
+        if not is_controller(f"/sys/class/hidraw/{os.path.basename(requested)}"):
+            raise DeviceError(f"{requested} is not the ASRock LED Controller (26ce:01a2)")
+        return requested
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        if is_controller(node):
+            return "/dev/" + os.path.basename(node)
+    raise DeviceError("ASRock LED Controller (26ce:01a2) not found")
+
+
+class Polychrome:
+    TIMEOUT = 1.0
+
+    def __init__(self, path, verbose=False):
+        self.path = path
+        self.verbose = verbose
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            raise DeviceError(f"no permission to open {path} (run as root, or log in "
+                              "locally so OpenRGB's udev rule grants access)") from None
+        # Every open hidraw handle receives every input report, so replies meant
+        # for another program (a running OpenRGB) can be queued here already.
+        while select.select([self.fd], [], [], 0.02)[0]:
+            os.read(self.fd, 64)
+
+    def close(self):
+        os.close(self.fd)
+
+    def _request(self, cmd, arg, body=b"", match=None, timeout=TIMEOUT):
+        # Report ID 0 followed by the 64-byte report; the kernel strips the ID.
+        # Byte offsets are kept identical to OpenRGB's usb_buf.
+        buf = bytearray(65)
+        buf[1] = cmd
+        buf[3] = arg
+        buf[4:4 + len(body)] = body
+        os.write(self.fd, bytes(buf))
+        while select.select([self.fd], [], [], timeout)[0]:
+            reply = os.read(self.fd, 64)
+            if self.verbose:
+                print(f"  0x{cmd:02x} {arg:02x} -> {reply[:12].hex(' ')}")
+            if match is None or match(reply):
+                return reply
+        raise DeviceError(f"no reply to command 0x{cmd:02x}")
+
+    def read_header(self, cfg):
+        return self._request(CMD_READ_HEADER, cfg, match=lambda r: r[3] == cfg)[4:]
+
+    def write_header(self, cfg, data):
+        self._request(CMD_WRITE_HEADER, cfg, data)
+
+    def read_zone(self, zone):
+        r = self._request(CMD_READ_ZONE, zone, match=lambda r: r[3] == zone)
+        return r[4], bytes(r[5:8]), r[8]  # effect, colour bytes as stored, speed
+
+    def set_zone(self, zone, effect, wire_colour, speed):
+        body = bytes([effect, *wire_colour, speed, 0xFF])
+        self._request(CMD_SET_ZONE, zone, body)
+
+    def commit(self):
+        # Flash write; give it longer than a normal transfer.
+        self._request(CMD_COMMIT, 0, timeout=3.0)
+
+
+@dataclass
+class Layout:
+    zones: list      # hardware zone ids present, in OpenRGB's zone order
+    counts: list     # 8 LED-count bytes
+    rgswap: int      # rgswap bitmask
+
+
+def read_layout(dev):
+    available = dev.read_header(CFG_AVAILABLE)[0]
+    counts = list(dev.read_header(CFG_LEDCOUNT)[:8])
+    rgswap = dev.read_header(CFG_RGSWAP)[0]
+    zones = [z for z in range(8) if counts[z] != ZONE_ABSENT and available >> z & 1]
+    return Layout(zones, counts, rgswap)
+
+
+def split_rgb(c):
+    # OpenRGB stores colours as 0x00BBGGRR.
+    return c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
+
+
+def to_wire(rgb, swapped):
+    r, g, b = rgb
+    return (r, g, b) if swapped else (g, r, b)
+
+
+def from_wire(raw, swapped):
+    a, b, c = raw
+    return (a, b, c) if swapped else (b, a, c)
+
+
+def hexcolour(rgb):
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+# --------------------------------------------------------------------------- #
+# OpenRGB profile handling
+# --------------------------------------------------------------------------- #
+
+def default_config_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / "OpenRGB"
+
+
+def load_settings(config_dir):
+    try:
+        return json.loads((config_dir / "OpenRGB.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def pick_profile(config_dir, settings, name):
+    profiles = config_dir / "profiles"
+    if name:
+        p = Path(name)
+        return p if p.is_file() else profiles / f"{name}.json"
+    # The profile OpenRGB loads at start-up is the one meant to be "the" lighting.
+    pm = settings.get("ProfileManager", {})
+    for key in ("open_profile", "service_startup_profile"):
+        entry = pm.get(key) or {}
+        if entry.get("enabled") and entry.get("name"):
+            return profiles / f"{entry['name']}.json"
+    candidates = sorted(profiles.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        raise SystemExit(f"no OpenRGB profiles in {profiles}")
+    return candidates[-1]
+
+
+def load_controller(path):
+    try:
+        data = json.loads(path.read_text())
+    except OSError as e:
+        raise SystemExit(f"cannot read profile: {e}")
+    except ValueError:
+        raise SystemExit(f"{path} is not a JSON profile (OpenRGB 1.x format needed)")
+    for ctrl in data.get("controllers", []):
+        if ctrl.get("description") == OPENRGB_DESCRIPTION:
+            return ctrl
+    raise SystemExit(f"{path} has no ASRock Polychrome USB entry")
+
+
+@dataclass
+class ZonePlan:
+    zone: int
+    leds: int
+    effect: int
+    rgb: tuple
+    speed: int
+    swapped: bool
+
+
+def build_plan(ctrl, layout, settings):
+    notes = []
+    mode = ctrl["modes"][ctrl["active_mode"]]
+    if mode["name"] == "Direct":
+        effect = EFFECTS["Static"]
+        notes.append("profile uses Direct mode, which the controller cannot store; "
+                     "saving it as Static (one colour per zone)")
+    elif mode["name"] in EFFECTS:
+        effect = EFFECTS[mode["name"]]
+    else:
+        raise SystemExit(f"unsupported mode {mode['name']!r} in profile")
+    speed = max(0, min(255, int(mode.get("speed", 0))))
+
+    pzones = ctrl["zones"]
+    if len(pzones) != len(layout.zones):
+        raise SystemExit(f"profile has {len(pzones)} ASRock zones but the controller "
+                         f"reports {len(layout.zones)}; re-save the profile in OpenRGB")
+
+    # Same rule as OpenRGB: swapped if the controller says so or settings ask for it.
+    rgswap_cfg = settings.get(OPENRGB_DETECTOR, {}).get("RGSwap", {})
+    swapped = [bool(layout.rgswap >> z & 1) or bool(rgswap_cfg.get(ZONE_NAMES[z], False))
+               for z in range(8)]
+
+    colours = ctrl["colors"]
+    plans, counts, offset = [], list(layout.counts), 0
+    for pz, hz in zip(pzones, layout.zones):
+        n = pz["leds_count"]
+        zone_colours = colours[offset:offset + n]
+        offset += n
+        if hz in ADDRESSABLE_ZONES:
+            counts[hz] = n
+        if n == 0:
+            continue  # nothing connected; OpenRGB skips these too
+        if effect in COLOURED_EFFECTS and len(set(zone_colours)) > 1:
+            notes.append(f"{ZONE_NAMES[hz]}: LEDs have different colours; the controller "
+                         "stores one colour per zone, using LED 1's")
+        plans.append(ZonePlan(hz, n, effect, split_rgb(zone_colours[0]), speed, swapped[hz]))
+
+    rgswap = sum(1 << z for z in range(8) if swapped[z])
+    return plans, counts, rgswap, notes
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def cmd_status(args):
+    path = find_device(args.device)
+    dev = Polychrome(path, args.verbose)
+    try:
+        layout = read_layout(dev)
+        print(f"ASRock LED Controller at {path}")
+        print(f"  {'zone':<28}{'LEDs':>5}  {'effect':<17}{'colour':<9}{'speed':>5}  rg-swap")
+        for z in layout.zones:
+            effect, raw, speed = dev.read_zone(z)
+            swapped = bool(layout.rgswap >> z & 1)
+            name = EFFECT_NAMES.get(effect, f"0x{effect:02x}")
+            print(f"  {ZONE_NAMES[z]:<28}{layout.counts[z]:>5}  {name:<17}"
+                  f"{hexcolour(from_wire(raw, swapped)):<9}{speed:>5}  {'yes' if swapped else 'no'}")
+    finally:
+        dev.close()
+
+
+def cmd_apply(args):
+    config_dir = Path(args.config_dir) if args.config_dir else default_config_dir()
+    settings = load_settings(config_dir)
+    profile = pick_profile(config_dir, settings, args.profile)
+    ctrl = load_controller(profile)
+    mode_name = ctrl["modes"][ctrl["active_mode"]]["name"]
+    print(f"Profile {profile} (mode: {mode_name})")
+
+    path = find_device(args.device)
+    dev = Polychrome(path, args.verbose)
+    try:
+        layout = read_layout(dev)
+        plans, counts, rgswap, notes = build_plan(ctrl, layout, settings)
+        for n in notes:
+            print(f"note: {n}")
+
+        verb = "Would write" if args.dry_run else "Writing"
+        print(f"{verb} to {path}:")
+        for p in plans:
+            colour = hexcolour(p.rgb) if p.effect in COLOURED_EFFECTS else "-"
+            print(f"  {ZONE_NAMES[p.zone]:<28}{EFFECT_NAMES[p.effect]:<16}{colour:<9}"
+                  f"speed {p.speed}")
+        if args.dry_run:
+            return
+
+        if counts != layout.counts:
+            dev.write_header(CFG_LEDCOUNT, bytes(counts))
+        dev.write_header(CFG_RGSWAP, bytes([rgswap]))
+        for p in plans:
+            dev.set_zone(p.zone, p.effect, to_wire(p.rgb, p.swapped), p.speed)
+        dev.commit()
+
+        mismatches = []
+        if dev.read_header(CFG_RGSWAP)[0] != rgswap:
+            mismatches.append("rg-swap")
+        for p in plans:
+            effect, raw, speed = dev.read_zone(p.zone)
+            if (effect, raw, speed) != (p.effect, bytes(to_wire(p.rgb, p.swapped)), p.speed):
+                mismatches.append(ZONE_NAMES[p.zone])
+        if mismatches:
+            raise DeviceError("committed, but read-back differs for: " + ", ".join(mismatches))
+        print("Committed to controller flash; read-back matches.")
+    finally:
+        dev.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--device", help="hidraw node (default: auto-detect 26ce:01a2)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="print raw replies")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="show what the controller currently holds")
+
+    a = sub.add_parser("apply", help="write a profile to the controller and commit it")
+    a.add_argument("--profile", help="profile name or path (default: OpenRGB's "
+                   "start-up profile, else the newest one)")
+    a.add_argument("--config-dir", help="OpenRGB config dir (default: ~/.config/OpenRGB)")
+    a.add_argument("-n", "--dry-run", action="store_true", help="show the plan, write nothing")
+
+    args = ap.parse_args()
+    try:
+        {"status": cmd_status, "apply": cmd_apply}[args.command](args)
+    except (DeviceError, OSError) as e:
+        sys.exit(f"error: {e}")
+
+
+if __name__ == "__main__":
+    main()
