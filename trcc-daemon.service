@@ -1,0 +1,8 @@
+[Unit]
+Description=TRCC daemon (Thermalright cooler display)
+
+[Service]
+ExecStart=/usr/bin/trcc daemon
+
+[Install]
+WantedBy=default.target
