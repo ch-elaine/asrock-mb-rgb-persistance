@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+import argparse
+import ctypes
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import ak820pro
+
+
+class RgbToolError(Exception):
+    pass
+
+
+class Colour:
+    @staticmethod
+    def from_openrgb(value):
+        return value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF
+
+    @staticmethod
+    def to_wire(colour, swapped):
+        red, green, blue = colour
+        return (red, green, blue) if swapped else (green, red, blue)
+
+    @staticmethod
+    def from_wire(wire_colour, swapped):
+        first, second, third = wire_colour
+        return (first, second, third) if swapped else (second, first, third)
+
+    @staticmethod
+    def to_hex(colour):
+        return "#{:02X}{:02X}{:02X}".format(*colour)
+
+
+@dataclass
+class ZoneLayout:
+    zones: list
+    led_counts: list
+    rgb_swap_mask: int
+
+
+@dataclass
+class ZonePlan:
+    zone: int
+    led_count: int
+    effect: int
+    colour: tuple
+    speed: int
+    swapped: bool
+
+
+@dataclass
+class BoardPlan:
+    zone_plans: list
+    led_counts: list
+    rgb_swap_mask: int
+    notes: list
+
+
+class PolychromeController:
+    HID_ID = "0003:000026CE:000001A2"
+    NAME = "ASRock LED Controller (26ce:01a2)"
+    REPORT_SIZE = 64
+    REPLY_TIMEOUT = 1.0
+    COMMIT_TIMEOUT = 3.0
+    DRAIN_TIMEOUT = 0.02
+
+    SET_ZONE = 0x10
+    READ_ZONE = 0x11
+    COMMIT = 0x12
+    READ_HEADER = 0x14
+    WRITE_HEADER = 0x15
+
+    HEADER_AVAILABLE_ZONES = 0x01
+    HEADER_LED_COUNTS = 0x02
+    HEADER_RGB_SWAP = 0x03
+
+    ZONE_COUNT = 8
+    ZONE_ABSENT = 0x1E
+    ADDRESSABLE_ZONES = {2, 3, 7}
+    ZONE_NAMES = [
+        "RGB LED 1 Header",
+        "RGB LED 2 Header",
+        "Addressable Header 1",
+        "Addressable Header 2",
+        "PCH",
+        "IO Cover",
+        "PCB",
+        "Addressable Header 3/Audio",
+    ]
+
+    EFFECTS = {
+        "Off": 0x00, "Static": 0x01, "Breathing": 0x02, "Strobe": 0x03,
+        "Spectrum Cycle": 0x04, "Random": 0x05, "Music": 0x06, "Wave": 0x07,
+        "Spring": 0x08, "Stack": 0x09, "Cram": 0x0A, "Scan": 0x0B,
+        "Neon": 0x0C, "Water": 0x0D, "Rainbow": 0x0E,
+    }
+    COLOURED_EFFECTS = {0x01, 0x02, 0x03}
+    EFFECT_NAMES = {value: name for name, value in EFFECTS.items()} | {
+        0x0F: "Direct",
+        0xE2: "Direct (stream)",
+        0xE3: "Direct (stream)",
+    }
+
+    def __init__(self, path, verbose=False):
+        self.path = path
+        self.verbose = verbose
+        try:
+            self.descriptor = os.open(path, os.O_RDWR)
+        except PermissionError:
+            raise RgbToolError(f"no permission to open {path} (run as root, or log in "
+                               "locally so OpenRGB's udev rule grants access)") from None
+        self._discard_pending_reports()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception_info):
+        os.close(self.descriptor)
+
+    @classmethod
+    def is_controller(cls, sysfs_node):
+        try:
+            return f"HID_ID={cls.HID_ID}" in Path(sysfs_node, "device/uevent").read_text()
+        except OSError:
+            return False
+
+    @classmethod
+    def locate(cls, requested_path=None):
+        if requested_path:
+            if not cls.is_controller(f"/sys/class/hidraw/{os.path.basename(requested_path)}"):
+                raise RgbToolError(f"{requested_path} is not the {cls.NAME}")
+            return requested_path
+        for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+            if cls.is_controller(node):
+                return "/dev/" + os.path.basename(node)
+        raise RgbToolError(f"{cls.NAME} not found")
+
+    def _discard_pending_reports(self):
+        while select.select([self.descriptor], [], [], self.DRAIN_TIMEOUT)[0]:
+            os.read(self.descriptor, self.REPORT_SIZE)
+
+    def _request(self, command, argument, body=b"", accept=None, timeout=REPLY_TIMEOUT):
+        report = bytearray(self.REPORT_SIZE + 1)
+        report[1] = command
+        report[3] = argument
+        report[4:4 + len(body)] = body
+        os.write(self.descriptor, bytes(report))
+        while select.select([self.descriptor], [], [], timeout)[0]:
+            reply = os.read(self.descriptor, self.REPORT_SIZE)
+            if self.verbose:
+                print(f"  0x{command:02x} {argument:02x} -> {reply[:12].hex(' ')}")
+            if accept is None or accept(reply):
+                return reply
+        raise RgbToolError(f"no reply to command 0x{command:02x}")
+
+    def read_header(self, header):
+        return self._request(self.READ_HEADER, header, accept=lambda reply: reply[3] == header)[4:]
+
+    def write_header(self, header, data):
+        self._request(self.WRITE_HEADER, header, data)
+
+    def read_zone(self, zone):
+        reply = self._request(self.READ_ZONE, zone, accept=lambda reply: reply[3] == zone)
+        return reply[4], bytes(reply[5:8]), reply[8]
+
+    def set_zone(self, zone, effect, wire_colour, speed):
+        self._request(self.SET_ZONE, zone, bytes([effect, *wire_colour, speed, 0xFF]))
+
+    def commit(self):
+        self._request(self.COMMIT, 0, timeout=self.COMMIT_TIMEOUT)
+
+    def read_layout(self):
+        available_mask = self.read_header(self.HEADER_AVAILABLE_ZONES)[0]
+        led_counts = list(self.read_header(self.HEADER_LED_COUNTS)[:self.ZONE_COUNT])
+        rgb_swap_mask = self.read_header(self.HEADER_RGB_SWAP)[0]
+        zones = [
+            zone for zone in range(self.ZONE_COUNT)
+            if led_counts[zone] != self.ZONE_ABSENT and available_mask >> zone & 1
+        ]
+        return ZoneLayout(zones, led_counts, rgb_swap_mask)
+
+
+class Board:
+    PROFILE_DESCRIPTION = "ASRock Polychrome USB Device"
+    SETTINGS_SECTION = "ASRock Polychrome USB"
+
+    def __init__(self, requested_path=None, verbose=False):
+        self.requested_path = requested_path
+        self.verbose = verbose
+
+    def _connect(self):
+        return PolychromeController(PolychromeController.locate(self.requested_path), self.verbose)
+
+    def print_status(self):
+        with self._connect() as controller:
+            layout = controller.read_layout()
+            print(f"Board, {controller.path}:")
+            print(f"  {'zone':<28}{'LEDs':>5}  {'effect':<17}{'colour':<9}{'speed':>5}  rg-swap")
+            for zone in layout.zones:
+                effect, wire_colour, speed = controller.read_zone(zone)
+                swapped = bool(layout.rgb_swap_mask >> zone & 1)
+                effect_name = controller.EFFECT_NAMES.get(effect, f"0x{effect:02x}")
+                colour = Colour.to_hex(Colour.from_wire(wire_colour, swapped))
+                print(f"  {controller.ZONE_NAMES[zone]:<28}{layout.led_counts[zone]:>5}  "
+                      f"{effect_name:<17}{colour:<9}{speed:>5}  {'yes' if swapped else 'no'}")
+
+    def apply(self, profile_entry, settings, dry_run):
+        with self._connect() as controller:
+            layout = controller.read_layout()
+            plan = self._plan(profile_entry, layout, settings)
+            print(f"Board, {controller.path}:")
+            for note in plan.notes:
+                print(f"  note: {note}")
+            for zone_plan in plan.zone_plans:
+                coloured = zone_plan.effect in controller.COLOURED_EFFECTS
+                colour = Colour.to_hex(zone_plan.colour) if coloured else "-"
+                print(f"  {controller.ZONE_NAMES[zone_plan.zone]:<28}"
+                      f"{controller.EFFECT_NAMES[zone_plan.effect]:<16}{colour:<9}speed {zone_plan.speed}")
+            if dry_run:
+                return
+            self._write(controller, layout, plan)
+            self._verify(controller, plan)
+            print("  committed to controller flash; read-back matches")
+
+    def _plan(self, profile_entry, layout, settings):
+        notes = []
+        mode = profile_entry["modes"][profile_entry["active_mode"]]
+        if mode["name"] == "Direct":
+            effect = PolychromeController.EFFECTS["Static"]
+            notes.append("profile uses Direct mode, which the controller cannot store; "
+                         "saving it as Static (one colour per zone)")
+        elif mode["name"] in PolychromeController.EFFECTS:
+            effect = PolychromeController.EFFECTS[mode["name"]]
+        else:
+            raise RgbToolError(f"unsupported board mode {mode['name']!r} in profile")
+        speed = max(0, min(255, int(mode.get("speed", 0))))
+
+        profile_zones = profile_entry["zones"]
+        if len(profile_zones) != len(layout.zones):
+            raise RgbToolError(f"profile has {len(profile_zones)} ASRock zones but the controller "
+                               f"reports {len(layout.zones)}; re-save the profile in OpenRGB")
+
+        swap_settings = settings.get(self.SETTINGS_SECTION, {}).get("RGSwap", {})
+        swapped = [
+            bool(layout.rgb_swap_mask >> zone & 1)
+            or bool(swap_settings.get(PolychromeController.ZONE_NAMES[zone], False))
+            for zone in range(PolychromeController.ZONE_COUNT)
+        ]
+
+        colours = profile_entry["colors"]
+        zone_plans = []
+        led_counts = list(layout.led_counts)
+        offset = 0
+        for profile_zone, zone in zip(profile_zones, layout.zones):
+            led_count = profile_zone["leds_count"]
+            zone_colours = colours[offset:offset + led_count]
+            offset += led_count
+            if zone in PolychromeController.ADDRESSABLE_ZONES:
+                led_counts[zone] = led_count
+            if led_count == 0:
+                continue
+            if effect in PolychromeController.COLOURED_EFFECTS and len(set(zone_colours)) > 1:
+                notes.append(f"{PolychromeController.ZONE_NAMES[zone]}: LEDs have different colours; "
+                             "the controller stores one colour per zone, using LED 1's")
+            zone_plans.append(ZonePlan(zone, led_count, effect, Colour.from_openrgb(zone_colours[0]),
+                                       speed, swapped[zone]))
+
+        rgb_swap_mask = sum(1 << zone for zone in range(PolychromeController.ZONE_COUNT) if swapped[zone])
+        return BoardPlan(zone_plans, led_counts, rgb_swap_mask, notes)
+
+    @staticmethod
+    def _write(controller, layout, plan):
+        if plan.led_counts != layout.led_counts:
+            controller.write_header(controller.HEADER_LED_COUNTS, bytes(plan.led_counts))
+        controller.write_header(controller.HEADER_RGB_SWAP, bytes([plan.rgb_swap_mask]))
+        for zone_plan in plan.zone_plans:
+            controller.set_zone(zone_plan.zone, zone_plan.effect,
+                                Colour.to_wire(zone_plan.colour, zone_plan.swapped), zone_plan.speed)
+        controller.commit()
+
+    @staticmethod
+    def _verify(controller, plan):
+        mismatches = []
+        if controller.read_header(controller.HEADER_RGB_SWAP)[0] != plan.rgb_swap_mask:
+            mismatches.append("rg-swap")
+        for zone_plan in plan.zone_plans:
+            expected = (zone_plan.effect, bytes(Colour.to_wire(zone_plan.colour, zone_plan.swapped)),
+                        zone_plan.speed)
+            if controller.read_zone(zone_plan.zone) != expected:
+                mismatches.append(controller.ZONE_NAMES[zone_plan.zone])
+        if mismatches:
+            raise RgbToolError("committed, but read-back differs for: " + ", ".join(mismatches))
+
+
+class SmbusData(ctypes.Union):
+    _fields_ = [("byte", ctypes.c_uint8), ("word", ctypes.c_uint16),
+                ("block", ctypes.c_uint8 * 34)]
+
+
+class SmbusIoctlArguments(ctypes.Structure):
+    _fields_ = [("read_write", ctypes.c_uint8), ("command", ctypes.c_uint8),
+                ("size", ctypes.c_uint32), ("data", ctypes.POINTER(SmbusData))]
+
+
+class EneRamController:
+    ADDRESSES = range(0x70, 0x78)
+    NAME_PREFIXES = ("DIMM_LED-", "AUDA0-", "AUMA0-")
+
+    I2C_SLAVE = 0x0703
+    I2C_SMBUS = 0x0720
+    SMBUS_WRITE = 0
+    SMBUS_READ = 1
+    SMBUS_BYTE_DATA = 2
+    SMBUS_WORD_DATA = 3
+
+    SELECT_COMMAND = 0x00
+    WRITE_COMMAND = 0x01
+    READ_COMMAND = 0x81
+    SIGNATURE_START = 0xA0
+    SIGNATURE_LENGTH = 16
+    NAME_LENGTH = 16
+
+    DEVICE_NAME_REGISTER = 0x1000
+    DIRECT_MODE_REGISTER = 0x8020
+    MODE_REGISTER = 0x8021
+    APPLY_REGISTER = 0x80A0
+    SAVE_VALUE = 0xAA
+
+    MODES = {
+        "Off": 0, "Static": 1, "Breathing": 2, "Flashing": 3, "Spectrum Cycle": 4,
+        "Rainbow": 5, "Chase Fade": 7, "Chase": 9, "Random Flicker": 13, "Double Fade": 14,
+    }
+    RANDOM_COLOUR_MODES = {2: 6, 7: 8, 9: 10}
+    MODE_NAMES = {value: name for name, value in MODES.items()} | {
+        6: "Breathing (random)", 8: "Chase Fade (random)", 10: "Chase (random)",
+        11: "Wave", 12: "Rainbow Pulse",
+    }
+
+    def __init__(self, bus_path, address):
+        if address not in self.ADDRESSES:
+            raise RgbToolError(f"refusing SMBus address 0x{address:02x}: not an ENE RAM address")
+        self.address = address
+        self.name = None
+        try:
+            self.descriptor = os.open(bus_path, os.O_RDWR)
+        except OSError as error:
+            raise RgbToolError(f"cannot open {bus_path}: {error.strerror}") from None
+        try:
+            fcntl.ioctl(self.descriptor, self.I2C_SLAVE, address)
+        except OSError as error:
+            os.close(self.descriptor)
+            raise RgbToolError(f"0x{address:02x} on {bus_path}: {error.strerror}") from None
+
+    @classmethod
+    def connect(cls, adapter_name, address):
+        controller = cls(cls.find_bus(adapter_name), address)
+        controller.name = controller.identify()
+        if controller.name is None:
+            controller.close()
+            raise RgbToolError(f"0x{address:02x}: no ENE RAM controller answers there")
+        return controller
+
+    @staticmethod
+    def find_bus(adapter_name):
+        for node in sorted(glob.glob("/sys/class/i2c-dev/i2c-*")):
+            try:
+                if Path(node, "name").read_text().strip() == adapter_name:
+                    return "/dev/" + os.path.basename(node)
+            except OSError:
+                continue
+        raise RgbToolError(f"SMBus adapter {adapter_name!r} not found")
+
+    def close(self):
+        os.close(self.descriptor)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception_info):
+        self.close()
+
+    def _smbus(self, read_write, command, size, data):
+        fcntl.ioctl(self.descriptor, self.I2C_SMBUS,
+                    SmbusIoctlArguments(read_write, command, size, ctypes.pointer(data)))
+
+    def _read_byte_data(self, command):
+        data = SmbusData()
+        self._smbus(self.SMBUS_READ, command, self.SMBUS_BYTE_DATA, data)
+        return data.byte
+
+    def _write_word_data(self, command, word):
+        self._smbus(self.SMBUS_WRITE, command, self.SMBUS_WORD_DATA, SmbusData(word=word))
+
+    def _write_byte_data(self, command, value):
+        self._smbus(self.SMBUS_WRITE, command, self.SMBUS_BYTE_DATA, SmbusData(byte=value))
+
+    def _select_register(self, register):
+        self._write_word_data(self.SELECT_COMMAND, ((register << 8) & 0xFF00) | ((register >> 8) & 0xFF))
+
+    def read_register(self, register):
+        self._select_register(register)
+        return self._read_byte_data(self.READ_COMMAND)
+
+    def write_register(self, register, value):
+        self._select_register(register)
+        self._write_byte_data(self.WRITE_COMMAND, value)
+
+    def identify(self):
+        try:
+            if any(self._read_byte_data(self.SIGNATURE_START + index) != index
+                   for index in range(self.SIGNATURE_LENGTH)):
+                return None
+            raw_name = bytes(self.read_register(self.DEVICE_NAME_REGISTER + index)
+                             for index in range(self.NAME_LENGTH))
+        except OSError:
+            return None
+        name = raw_name.split(b"\0")[0].decode("ascii", "replace")
+        return name if name.startswith(self.NAME_PREFIXES) else None
+
+    def in_direct_mode(self):
+        return bool(self.read_register(self.DIRECT_MODE_REGISTER))
+
+    def mode(self):
+        return self.read_register(self.MODE_REGISTER)
+
+    def save(self):
+        self.write_register(self.APPLY_REGISTER, self.SAVE_VALUE)
+
+
+@dataclass
+class RamStick:
+    adapter: str
+    address: int
+    mode_name: str
+    expected_mode: int | None
+
+
+class Ram:
+    PROFILE_DESCRIPTION = "ENE SMBus Device"
+    DEVICE_TYPE_DRAM = 1
+    RANDOM_COLOUR_MODE = 3
+    LOCATION_PATTERN = re.compile(r"I2C: (.+) \(/dev/i2c-\d+\), address 0x([0-9A-Fa-f]{2})$")
+
+    def __init__(self, sticks):
+        self.sticks = sticks
+
+    @classmethod
+    def from_profile(cls, profile_data):
+        sticks = []
+        for entry in profile_data.get("controllers", []):
+            if entry.get("description") != cls.PROFILE_DESCRIPTION or entry.get("type") != cls.DEVICE_TYPE_DRAM:
+                continue
+            location = cls.LOCATION_PATTERN.match(entry.get("location", ""))
+            if not location:
+                continue
+            mode = entry["modes"][entry["active_mode"]]
+            expected_mode = EneRamController.MODES.get(mode["name"])
+            if expected_mode is not None and mode.get("color_mode") == cls.RANDOM_COLOUR_MODE:
+                expected_mode = EneRamController.RANDOM_COLOUR_MODES.get(expected_mode, expected_mode)
+            sticks.append(RamStick(location.group(1), int(location.group(2), 16), mode["name"], expected_mode))
+        return cls(sticks)
+
+    def print_status(self):
+        print("RAM:")
+        if OpenRgb.is_running():
+            print("  not read while OpenRGB is running (it uses the same bus)")
+            return
+        for stick in self.sticks:
+            try:
+                with EneRamController.connect(stick.adapter, stick.address) as controller:
+                    direct = controller.in_direct_mode()
+                    mode = controller.mode()
+                label = "Direct" if direct else EneRamController.MODE_NAMES.get(mode, f"0x{mode:02x}")
+                print(f"  0x{stick.address:02x}  {controller.name:<18}{label}")
+            except (RgbToolError, OSError) as error:
+                print(f"  {error}")
+
+    def save(self):
+        errors = []
+        print("RAM:")
+        for stick in self.sticks:
+            try:
+                with EneRamController.connect(stick.adapter, stick.address) as controller:
+                    if controller.in_direct_mode():
+                        raise RgbToolError(f"0x{stick.address:02x}: still in Direct mode; not saving")
+                    mode = controller.mode()
+                    if mode != stick.expected_mode:
+                        raise RgbToolError(f"0x{stick.address:02x}: holds "
+                                           f"{EneRamController.MODE_NAMES.get(mode, mode)!s}, not the profile's "
+                                           f"{stick.mode_name}; not saving")
+                    controller.save()
+                print(f"  0x{stick.address:02x}  {controller.name:<18}{stick.mode_name:<16}saved to the stick")
+            except (RgbToolError, OSError) as error:
+                errors.append(f"RAM {error}")
+        return errors
+
+
+@dataclass
+class Profile:
+    path: Path
+    data: dict
+
+    @classmethod
+    def read(cls, path):
+        try:
+            return cls(path, json.loads(path.read_text()))
+        except OSError as error:
+            raise RgbToolError(f"cannot read profile: {error.strerror}: {path}") from None
+        except ValueError:
+            raise RgbToolError(f"{path} is not a JSON profile (OpenRGB 1.x format needed)") from None
+
+    def board_entry(self):
+        for entry in self.data.get("controllers", []):
+            if entry.get("description") == Board.PROFILE_DESCRIPTION:
+                return entry
+        return None
+
+    def ram(self):
+        return Ram.from_profile(self.data)
+
+
+class OpenRgb:
+    PROCESS_NAME = "openrgb"
+    LOAD_TIMEOUT = 120
+    LOADED_MESSAGE = "Profile loaded successfully"
+    STARTUP_PROFILE_KEYS = ("open_profile", "service_startup_profile")
+
+    def __init__(self, config_dir=None):
+        if config_dir:
+            self.config_dir = Path(config_dir)
+        else:
+            config_home = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+            self.config_dir = Path(config_home) / "OpenRGB"
+        self.settings = self._read_settings()
+
+    @property
+    def profiles_dir(self):
+        return self.config_dir / "profiles"
+
+    def _read_settings(self):
+        try:
+            return json.loads((self.config_dir / "OpenRGB.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def find_profile(self, name=None):
+        if name:
+            path = Path(name)
+            return path if path.is_file() else self.profiles_dir / f"{name}.json"
+        profile_manager = self.settings.get("ProfileManager", {})
+        for key in self.STARTUP_PROFILE_KEYS:
+            entry = profile_manager.get(key) or {}
+            if entry.get("enabled") and entry.get("name"):
+                return self.profiles_dir / f"{entry['name']}.json"
+        candidates = sorted(self.profiles_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)
+        if not candidates:
+            raise RgbToolError(f"no OpenRGB profiles in {self.profiles_dir}")
+        return candidates[-1]
+
+    def load_profile(self, name=None):
+        return Profile.read(self.find_profile(name))
+
+    def owns(self, profile):
+        return profile.path.parent.resolve() == self.profiles_dir.resolve()
+
+    def apply_profile(self, profile):
+        command = ["openrgb", "--noautoconnect", "--config", str(self.config_dir),
+                   "--profile", profile.path.stem]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=self.LOAD_TIMEOUT)
+        except FileNotFoundError:
+            raise RgbToolError("openrgb is not installed") from None
+        except subprocess.TimeoutExpired:
+            raise RgbToolError("OpenRGB did not finish loading the profile within 2 minutes") from None
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode != 0 or self.LOADED_MESSAGE not in output:
+            raise RgbToolError("OpenRGB could not load the profile:\n" + output[-800:])
+
+    @classmethod
+    def is_running(cls):
+        for comm_file in glob.glob("/proc/[0-9]*/comm"):
+            try:
+                if Path(comm_file).read_text().strip() == cls.PROCESS_NAME:
+                    return True
+            except OSError:
+                continue
+        return False
+
+
+class RgbTool:
+    def __init__(self):
+        self.parser = self._build_parser()
+
+    def _build_parser(self):
+        parser = argparse.ArgumentParser(
+            description="Save an OpenRGB profile into the motherboard's and the RAM's own memory, "
+                        "and control the Ajazz AK820 Pro keyboard."
+        )
+        parser.add_argument("--config-dir", help="OpenRGB config dir (default: ~/.config/OpenRGB)")
+        parser.add_argument("--device", help="board hidraw node (default: auto-detect 26ce:01a2)")
+        parser.add_argument("-v", "--verbose", action="store_true", help="print raw board replies")
+        commands = parser.add_subparsers(dest="command", required=True)
+
+        status_parser = commands.add_parser("status", help="show what the board and RAM currently hold")
+        status_parser.set_defaults(handler=self.status)
+
+        apply_parser = commands.add_parser("apply", help="save a profile into the board and the RAM")
+        apply_parser.add_argument("--profile", help="profile name or path (default: OpenRGB's "
+                                  "start-up profile, else the newest one)")
+        apply_parser.add_argument("-n", "--dry-run", action="store_true", help="show the plan, write nothing")
+        apply_parser.set_defaults(handler=self.apply)
+
+        keyboard_parser = commands.add_parser("keyboard", help="Ajazz AK820 Pro: static colour, screen image, clock")
+        ak820pro.KeyboardCli.register(keyboard_parser)
+        return parser
+
+    def run(self, argv=None):
+        args = self.parser.parse_args(argv)
+        try:
+            errors = args.handler(args) or []
+        except (RgbToolError, ak820pro.KeyboardError, OSError) as error:
+            errors = [str(error)]
+        except KeyboardInterrupt:
+            errors = ["interrupted"]
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
+        return 1 if errors else 0
+
+    def status(self, args):
+        errors = []
+        try:
+            Board(args.device, args.verbose).print_status()
+        except (RgbToolError, OSError) as error:
+            errors.append(f"board: {error}")
+        try:
+            ram = OpenRgb(args.config_dir).load_profile().ram()
+            if ram.sticks:
+                ram.print_status()
+        except RgbToolError as error:
+            errors.append(f"RAM: {error}")
+        return errors
+
+    def apply(self, args):
+        openrgb = OpenRgb(args.config_dir)
+        profile = openrgb.load_profile(args.profile)
+        board_entry = profile.board_entry()
+        ram = profile.ram()
+        if board_entry is None and not ram.sticks:
+            raise RgbToolError(f"{profile.path} has neither the ASRock board nor ENE RAM in it")
+        print(f"Profile {profile.path}")
+
+        errors = []
+        savable_sticks = []
+        for stick in ram.sticks:
+            if stick.expected_mode is None:
+                errors.append(f"RAM 0x{stick.address:02x}: {stick.mode_name} mode can't be saved to the "
+                              "stick; switch it to Static (or another effect) in OpenRGB")
+            else:
+                savable_sticks.append(stick)
+
+        if savable_sticks:
+            try:
+                savable_sticks = self._load_profile_for_ram(openrgb, profile, savable_sticks, args.dry_run)
+            except RgbToolError as error:
+                errors.append(f"RAM: {error}")
+                savable_sticks = []
+
+        if board_entry is not None:
+            try:
+                Board(args.device, args.verbose).apply(board_entry, openrgb.settings, args.dry_run)
+            except (RgbToolError, OSError) as error:
+                errors.append(f"board: {error}")
+
+        if savable_sticks:
+            errors += Ram(savable_sticks).save()
+        return errors
+
+    @staticmethod
+    def _load_profile_for_ram(openrgb, profile, sticks, dry_run):
+        if OpenRgb.is_running():
+            raise RgbToolError("close OpenRGB first; it uses the same bus, so the RAM was left alone")
+        if not openrgb.owns(profile):
+            raise RgbToolError("the profile must be in OpenRGB's profiles folder")
+        if dry_run:
+            addresses = ", ".join(f"0x{stick.address:02x}" for stick in sticks)
+            print(f"RAM: would load the profile with OpenRGB, then save it to the sticks at {addresses}")
+            return []
+        print("RAM: loading the profile with OpenRGB ...")
+        openrgb.apply_profile(profile)
+        return sticks
+
+
+if __name__ == "__main__":
+    sys.exit(RgbTool().run())
