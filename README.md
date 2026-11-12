@@ -1,41 +1,53 @@
 # asrock-rgb-persist
 
-Makes OpenRGB lighting on ASRock Polychrome USB boards (`26ce:01a2`, e.g. B650M Pro RS)
-survive reboots, the way Polychrome Sync does on Windows.
+Saves an OpenRGB profile into the hardware, so the lighting survives reboots, the way
+Polychrome Sync does on Windows. It covers:
 
-OpenRGB never sends the controller's commit-to-flash command (`0x12`). Its Direct mode is
-also a live stream that the controller can't store. So after power-on the LEDs stay dark until
-OpenRGB starts. This script reads a saved OpenRGB profile, turns the ASRock entry into the
-controller's built-in per-zone effects, writes them, and commits them to flash.
+- **The ASRock board:** the Polychrome USB controller (`26ce:01a2`, e.g. B650M Pro RS).
+  OpenRGB never sends its commit-to-flash command (`0x12`). This script converts the
+  profile to the controller's built-in per-zone effects, writes them, and commits them.
+- **ENE RAM sticks** ("ENE DRAM" in OpenRGB). OpenRGB's command line programs the
+  profile into the sticks. The script then sends each stick the save command that
+  OpenRGB's hidden "Save To Device" button sends.
 
-It needs only Python 3 and runs as your normal user; OpenRGB's udev rule already gives you
-access to the controller.
+It needs only Python 3 and OpenRGB, and runs as your normal user. OpenRGB's udev rule
+and the `i2c` group already give you access.
 
 ## Use
 
-Save the profile in OpenRGB, then run:
+Save the profile in OpenRGB and **close OpenRGB**, then run:
 
 ```sh
 ./asrock-rgb-persist apply -n             # show what would be written
-./asrock-rgb-persist apply                # write + commit
+./asrock-rgb-persist apply                # save to board + RAM
 ./asrock-rgb-persist apply --profile Work # a specific profile
-./asrock-rgb-persist status               # what the controller holds now
+./asrock-rgb-persist status               # what the board and RAM hold now
 ```
 
 The default profile is OpenRGB's start-up profile (Settings → Profiles); if none is set, the
-newest one is used. Changes count only once they're **saved** to the profile in OpenRGB.
+newest one is used.
 
-## If the LEDs are dark again after a reboot
+OpenRGB must be closed for the RAM part, because both talk to the RAM over the same bus.
+If OpenRGB is open, the board is still saved, the RAM is left alone, and the script says so.
 
-OpenRGB re-applies a profile when it exits (Settings → Profiles → exit, suspend and shutdown
-profiles). If that profile is in Direct mode, OpenRGB's exit write may replace what this script
-saved. Fix it either way:
+## How the RAM part stays safe
 
-- Save the profile in **Static** mode instead of Direct. A single colour per zone looks the same.
-- Or turn off OpenRGB's exit and shutdown profiles.
+The RAM shares its bus with each stick's memory-config chip and the power chip that sets
+memory voltage. So the script:
+
+- only ever addresses `0x70`–`0x77`, OpenRGB's ENE RAM range;
+- checks each stick with OpenRGB's read-only ENE signature, plus a known ENE RAM name;
+- saves only when the stick holds the profile's mode.
+
+## If the board is dark again after a reboot
+
+OpenRGB re-applies a profile when it exits. If that profile puts the board in Direct
+mode, the exit write may replace what this script saved. Use Static (or another
+effect) for the board in the profile, or just run `apply` again.
 
 ## Limits
 
-- The controller stores one effect and one colour per zone. A Direct-mode profile is saved
-  as Static, using each zone's first LED colour. Per-LED gradients need OpenRGB running.
+- The board stores one effect and one colour per zone. Direct mode is saved as Static,
+  using each zone's first LED colour.
+- RAM in Direct mode can't be saved to the stick; use Static or another effect.
 - Only OpenRGB 1.x JSON profiles are supported, not the older `.orp` format.
